@@ -157,6 +157,9 @@ pub enum RenderError {
     /// An image paint referenced an image that has not been uploaded.
     #[error("Missing image cache entry for {0:?}")]
     MissingImage(ImageId),
+    /// A Pixmap paint was used without preparing its GPU image allocation.
+    #[error("Pixmap paint {0} was not prepared for this render target")]
+    UnpreparedPixmap(usize),
     /// An intermediate texture allocation failed.
     #[error(transparent)]
     IntermediateTexture(#[from] IntermediateTextureError),

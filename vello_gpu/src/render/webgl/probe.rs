@@ -169,6 +169,7 @@ impl WebGlRenderer {
         let render_result = self.render_scene(
             &scene,
             &ImageCache::new_dummy(),
+            &crate::resources::PixmapImages::default(),
             &render_size,
             TargetInit::Clear(ClearSettings::Viewport { color: css::WHITE }),
             RootTarget::UserSurface,

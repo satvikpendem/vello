@@ -36,6 +36,7 @@ pub use error::{
 
 use crate::draw::{EXTERNAL_TEXTURE_SLOT_COUNT, ExternalTextureBindings, ExternalTextureRun};
 use crate::render::common::IMAGE_PADDING;
+use crate::resources::PixmapImages;
 use crate::util::RangedSlice;
 use crate::{
     ClearSettings, GpuStrip, LayersConfig, RenderError, RenderSettings, RenderSize, Resources,
@@ -532,22 +533,56 @@ impl WebGlRenderer {
             },
         )?;
 
-        self.render_scene(
-            scene,
-            &resources.image_cache,
-            render_size,
-            TargetInit::Clear(ClearSettings::Viewport { color: clear_color }),
-            RootTarget::UserSurface,
-            texture_bindings,
-            None,
-        )?;
+        let pixmaps = PixmapImages::prepare(&scene.encoded_paints, &mut resources.image_cache)?;
+        let result = (|| {
+            for (id, pixmap) in &pixmaps.uploads {
+                self.write_to_atlas(&resources.image_cache, *id, pixmap, None)?;
+            }
+            self.render_scene(
+                scene,
+                &resources.image_cache,
+                &pixmaps,
+                render_size,
+                TargetInit::Clear(ClearSettings::Viewport { color: clear_color }),
+                RootTarget::UserSurface,
+                texture_bindings,
+                None,
+            )
+        })();
+        let mut cleanup = Ok(());
+        for resource in pixmaps.release(&mut resources.image_cache) {
+            let padding = resource.padding;
+            if self
+                .programs
+                .resources
+                .atlas_textures
+                .get(resource.atlas_id.as_u32() as usize)
+                .is_some()
+            {
+                // A texture upload preserves the canvas framebuffer, viewport
+                // and scissor state after the root render.
+                let blank =
+                    Pixmap::new(resource.width + padding * 2, resource.height + padding * 2);
+                let cleared = WebGlAtlasWriter::write_to_atlas(
+                    &blank,
+                    &self.gl,
+                    &self.programs.resources.atlas_textures[resource.atlas_id.as_u32() as usize],
+                    [resource.offset[0] - padding, resource.offset[1] - padding],
+                    blank.width(),
+                    blank.height(),
+                );
+                if cleanup.is_ok() {
+                    cleanup = cleared;
+                }
+            }
+        }
 
         #[cfg(feature = "text")]
         // TODO: We should sort the rectangles once by atlas
         // page and then clear per atlas page instead of per rect.
         resources.after_render(self, clear_atlas_region)?;
 
-        Ok(())
+        result.and(cleanup)
     }
 
     /// Render a `scene` directly into an atlas layer.
@@ -618,6 +653,7 @@ impl WebGlRenderer {
         let result = self.render_scene(
             scene,
             &dummy_image_cache,
+            &PixmapImages::default(),
             &atlas_render_size,
             TargetInit::SrcOver,
             RootTarget::AtlasLayer,
@@ -657,6 +693,7 @@ impl WebGlRenderer {
         &mut self,
         scene: &Scene,
         image_cache: &ImageCache,
+        pixmaps: &PixmapImages,
         render_size: &RenderSize,
         target_init: TargetInit<'_>,
         root_output_target: RootTarget,
@@ -668,6 +705,7 @@ impl WebGlRenderer {
 
         self.prepare_gpu_encoded_paints(
             encoded_paints,
+            pixmaps,
             image_cache,
             texture_bindings,
             render_target_texture,
@@ -690,7 +728,8 @@ impl WebGlRenderer {
 
         let paint_resolver =
             PaintResolver::new(encoded_paints, &self.paint_idxs, &self.encoded_paints)
-                .with_image_cache(image_cache);
+                .with_image_cache(image_cache)
+                .with_pixmaps(pixmaps);
         let schedule = Schedule::try_new(
             &mut self.schedule_storage,
             scene,
@@ -936,6 +975,7 @@ impl WebGlRenderer {
     fn prepare_gpu_encoded_paints(
         &mut self,
         encoded_paints: &[EncodedPaint],
+        pixmaps: &PixmapImages,
         image_cache: &ImageCache,
         texture_bindings: &WebGlTextureBindings,
         render_target_texture: Option<&WebGlTexture>,
@@ -971,7 +1011,10 @@ impl WebGlRenderer {
                         )
                     }
                     ImageSource::Pixmap(_) => {
-                        panic!("pixmap image sources are not supported by Vello GPU")
+                        let id = pixmaps.image(encoded_paint_idx)?;
+                        let image_resource =
+                            image_cache.get(id).ok_or(RenderError::MissingImage(id))?;
+                        self.encode_image_paint(img, image_resource)
                     }
                 },
                 EncodedPaint::Gradient(gradient) => {

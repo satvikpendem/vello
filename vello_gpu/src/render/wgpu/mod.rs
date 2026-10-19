@@ -11,6 +11,7 @@ only break in edge cases, and some of them are also only related to conversions 
 
 use crate::draw::{EXTERNAL_TEXTURE_SLOT_COUNT, ExternalTextureBindings, ExternalTextureRun};
 use crate::render::common::IMAGE_PADDING;
+use crate::resources::PixmapImages;
 use crate::util::RangedSlice;
 use crate::{
     ClearSettings, GpuStrip, LayersConfig, RenderError, RenderSettings, RenderSize, Resources,
@@ -296,6 +297,18 @@ impl Renderer {
             )?;
         }
 
+        let pixmaps = PixmapImages::prepare(&scene.encoded_paints, &mut resources.image_cache)?;
+        for (id, pixmap) in &pixmaps.uploads {
+            self.write_to_atlas(
+                &resources.image_cache,
+                device,
+                queue,
+                encoder,
+                *id,
+                pixmap,
+                None,
+            );
+        }
         let result = self.render_scene(
             scene,
             device,
@@ -306,10 +319,22 @@ impl Renderer {
             depth_view,
             &resources.image_cache,
             &scene.encoded_paints,
+            &pixmaps,
             target_init,
             RootTarget::UserSurface,
             texture_bindings,
         );
+
+        for resource in pixmaps.release(&mut resources.image_cache) {
+            let padding = resource.padding;
+            self.clear_atlas_region(
+                encoder,
+                resource.atlas_id,
+                [resource.offset[0] - padding, resource.offset[1] - padding],
+                resource.width + padding * 2,
+                resource.height + padding * 2,
+            );
+        }
 
         #[cfg(feature = "text")]
         resources.after_render(self, |renderer, rect| {
@@ -379,6 +404,7 @@ impl Renderer {
             None,
             &dummy_image_cache,
             encoded_paints,
+            &PixmapImages::default(),
             TargetInit::SrcOver,
             RootTarget::AtlasLayer,
             texture_bindings,
@@ -417,6 +443,7 @@ impl Renderer {
         depth_view: Option<&TextureView>,
         image_cache: &ImageCache,
         encoded_paints: &[EncodedPaint],
+        pixmaps: &PixmapImages,
         target_init: TargetInit<'_>,
         root_output_target: RootTarget,
         texture_bindings: &TextureBindings,
@@ -424,6 +451,7 @@ impl Renderer {
         self.programs.depth_cleared_this_frame = false;
         self.prepare_gpu_encoded_paints(
             encoded_paints,
+            pixmaps,
             image_cache,
             texture_bindings,
             view.texture(),
@@ -442,7 +470,8 @@ impl Renderer {
         let current_allocations = self.current_allocations();
         let paint_resolver =
             PaintResolver::new(encoded_paints, &self.paint_idxs, &self.encoded_paints)
-                .with_image_cache(image_cache);
+                .with_image_cache(image_cache)
+                .with_pixmaps(pixmaps);
         let schedule = Schedule::try_new(
             &mut self.schedule_storage,
             scene,
@@ -677,6 +706,7 @@ impl Renderer {
     fn prepare_gpu_encoded_paints(
         &mut self,
         encoded_paints: &[EncodedPaint],
+        pixmaps: &PixmapImages,
         image_cache: &ImageCache,
         texture_bindings: &TextureBindings,
         render_target_texture: &Texture,
@@ -715,7 +745,10 @@ impl Renderer {
                         )
                     }
                     ImageSource::Pixmap(_) => {
-                        panic!("pixmap image sources are not supported by Vello GPU")
+                        let id = pixmaps.image(encoded_paint_idx)?;
+                        let image_resource =
+                            image_cache.get(id).ok_or(RenderError::MissingImage(id))?;
+                        self.encode_image_paint(img, image_resource)
                     }
                 },
                 EncodedPaint::Gradient(gradient) => {
@@ -3406,7 +3439,7 @@ impl AtlasWriter for Texture {
     }
 }
 
-/// Implementation for `Pixmap` - direct upload to atlas
+/// Implementation for `Pixmap` - encoder-ordered upload to atlas.
 impl AtlasWriter for Pixmap {
     fn width(&self) -> u16 {
         self.width()
@@ -3418,9 +3451,9 @@ impl AtlasWriter for Pixmap {
 
     fn write_to_atlas(
         &self,
-        _device: &Device,
-        queue: &Queue,
-        _encoder: &mut CommandEncoder,
+        device: &Device,
+        _queue: &Queue,
+        encoder: &mut CommandEncoder,
         atlas_texture: &Texture,
         offset: [u16; 2],
         width: u16,
@@ -3428,7 +3461,36 @@ impl AtlasWriter for Pixmap {
     ) {
         let width = u32::from(width);
         let height = u32::from(height);
-        queue.write_texture(
+        if width == 0 || height == 0 {
+            return;
+        }
+        // Keep upload -> draw -> clear ordered even when multiple renders are
+        // encoded before submission. Queue::write_texture would execute all
+        // uploads before the command buffers, corrupting reused atlas slots.
+        let row_bytes = width * 4;
+        let stride = row_bytes.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let mut data = vec![0; (stride * height) as usize];
+        for (source, target) in self
+            .data_as_u8_slice()
+            .chunks_exact(row_bytes as usize)
+            .zip(data.chunks_exact_mut(stride as usize))
+        {
+            target[..row_bytes as usize].copy_from_slice(source);
+        }
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Pixmap atlas upload"),
+            contents: &data,
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+        encoder.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(height),
+                },
+            },
             wgpu::TexelCopyTextureInfo {
                 texture: atlas_texture,
                 mip_level: 0,
@@ -3438,12 +3500,6 @@ impl AtlasWriter for Pixmap {
                     z: 0,
                 },
                 aspect: wgpu::TextureAspect::All,
-            },
-            self.data_as_u8_slice(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * width),
-                rows_per_image: Some(height),
             },
             Extent3d {
                 width,

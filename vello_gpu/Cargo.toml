@@ -43,6 +43,9 @@ web-sys = { workspace = true, features = [
 ], optional = true }
 
 [dev-dependencies]
+glifo = { workspace = true, features = ["std", "png"] }
+vello_cpu = { workspace = true }
+skrifa = { workspace = true, features = ["std"] }
 png = { workspace = true }
 pollster = { workspace = true }
 vello_common = { workspace = true, features = ["pico_svg"] }
@@ -79,3 +82,7 @@ workspace = true
 [[example]]
 name = "render_to_file"
 required-features = ["wgpu"]
+
+[[test]]
+name = "bitmap_images"
+required-features = ["wgpu", "text"]

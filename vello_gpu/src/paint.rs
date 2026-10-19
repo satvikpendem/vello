@@ -4,6 +4,7 @@
 //! GPU paint packing for scheduled strip draws.
 
 use crate::render::common::GpuEncodedPaint;
+use crate::resources::PixmapImages;
 use crate::util::pack_u16_pair;
 use vello_common::TextureId;
 use vello_common::encode::{EncodedKind, EncodedPaint};
@@ -151,6 +152,7 @@ pub(crate) struct PaintResolver<'a> {
     gpu_paints: &'a [GpuEncodedPaint],
     /// Resolves internal images to their atlas textures.
     image_cache: Option<&'a ImageCache>,
+    pixmaps: Option<&'a PixmapImages>,
 }
 
 impl<'a> PaintResolver<'a> {
@@ -170,7 +172,13 @@ impl<'a> PaintResolver<'a> {
             gpu_offsets,
             gpu_paints,
             image_cache: None,
+            pixmaps: None,
         }
+    }
+
+    pub(crate) fn with_pixmaps(mut self, pixmaps: &'a PixmapImages) -> Self {
+        self.pixmaps = Some(pixmaps);
+        self
     }
 
     /// Add the image cache needed to resolve internal image paints.
@@ -219,7 +227,15 @@ impl<'a> PaintResolver<'a> {
                                 Some(TextureSourceId::Atlas(image_resource.atlas_id)),
                             )
                         }
-                        ImageSource::Pixmap(_) => unimplemented!("Unsupported image source"),
+                        ImageSource::Pixmap(_) => {
+                            // GPU paint preparation has already validated this mapping.
+                            let id = self.pixmaps.unwrap().image(paint_id).unwrap();
+                            let image_resource = self.image_cache.unwrap().get(id).unwrap();
+                            (
+                                PAINT_TYPE_IMAGE,
+                                Some(TextureSourceId::Atlas(image_resource.atlas_id)),
+                            )
+                        }
                     },
                     EncodedPaint::Gradient(gradient) => {
                         let paint_type = match &gradient.kind {
